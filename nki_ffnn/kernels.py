@@ -23,8 +23,14 @@ def nki_transpose(in_tensor):
     out_tensor = nl.ndarray((o_rows, o_cols), dtype=in_tensor.dtype, buffer=nl.hbm)
 
     # YOUR CODE HERE
-
+    for i in nl.affine_range(i_rows // nl.tile_size.pmax):
+      i_p = i * nl.tile_size.pmax
+      for j in nl.affine_range(i_cols // nl.tile_size.pmax):
+        j_p = j * nl.tile_size.pmax
+        tile = nl.load_transpose2d(in_tensor[i_p:i_p+nl.tile_size.pmax, j_p:j_p+nl.tile_size.pmax])
+        nl.store(out_tensor[j_p:j_p+nl.tile_size.pmax, i_p:i_p+nl.tile_size.pmax], tile)
     return out_tensor
+    
 
 @nki.jit
 def nki_bias_add_act(A, b, act='relu'):
@@ -46,6 +52,53 @@ def nki_bias_add_act(A, b, act='relu'):
     result = nl.ndarray((BATCH_SIZE, HIDDEN_SIZE), dtype=A.dtype, buffer=nl.hbm)
 
     # YOUR CODE HERE
+    for i in nl.affine_range(BATCH_SIZE):
+      for j in nl.affine_range(HIDDEN_SIZE // nl.tile_size.pmax):
+        j_p = j * nl.tile_size.pmax
+        tile = nl.load(A[i, j_p:j_p+nl.tile_size.pmax])
+        bias = nl.load(b[0, j_p:j_p+nl.tile_size.pmax])
+        sum_tile = nl.add(tile, bias)
+        if act == 'relu':
+          nl.store(result[i, j_p:j_p+nl.tile_size.pmax], nl.relu(sum_tile))
+
+      if act == 'softmax':
+        row_idx = nl.mgrid[0:1, 0:nl.tile_size.pmax]
+        row_max = nl.ndarray((1, 1), dtype=A.dtype, buffer=nl.sbuf)
+        row_sum = nl.ndarray((1, 1), dtype=A.dtype, buffer=nl.sbuf)
+        tile = nl.load(A[i + row_idx.p, row_idx.x])
+        bias = nl.load(b[row_idx.p, row_idx.x])
+        sum_tile = nl.add(tile, bias)
+        row_max[...] = nl.max(sum_tile, axis=1)
+
+        for j in nl.sequential_range(1, HIDDEN_SIZE // nl.tile_size.pmax):
+          j_p = j * nl.tile_size.pmax
+          tile = nl.load(A[i+row_idx.p, j_p+row_idx.x])
+          bias = nl.load(b[row_idx.p, j_p+row_idx.x])
+          sum_tile = nl.add(tile, bias)
+          row_max[...] = nl.maximum(row_max, nl.max(sum_tile, axis=1))
+  
+        tile = nl.load(A[i+row_idx.p, row_idx.x])
+        bias = nl.load(b[row_idx.p, row_idx.x])
+        sum_tile = nl.add(tile, bias)
+        exp_tile = nl.exp(nl.subtract(sum_tile, row_max))
+        row_sum[...] = nl.sum(exp_tile, axis=1)
+
+        for j in nl.sequential_range(1, HIDDEN_SIZE // nl.tile_size.pmax):
+          j_p = j * nl.tile_size.pmax
+          tile = nl.load(A[i + row_idx.p, j_p+row_idx.x])
+          bias = nl.load(b[row_idx.p, j_p+row_idx.x])
+          sum_tile = nl.add(tile, bias)
+          exp_tile = nl.exp(nl.subtract(sum_tile, row_max))
+          row_sum[...] = nl.add(row_sum, nl.sum(exp_tile, axis=1))
+        
+        for j in nl.affine_range(0, HIDDEN_SIZE // nl.tile_size.pmax):
+          j_p = j * nl.tile_size.pmax
+          tile = nl.load(A[i+row_idx.p, j_p+row_idx.x])
+          bias = nl.load(b[row_idx.p, j_p+row_idx.x])
+          sum_tile = nl.add(tile, bias)
+          exp_tile = nl.exp(nl.subtract(sum_tile, row_max))
+          out_tile = nl.divide(exp_tile, row_sum)
+          nl.store(result[i+row_idx.p, j_p+row_idx.x], out_tile)
 
     return result
 
@@ -85,13 +138,11 @@ def nki_forward(
     raise ValueError(f"Unsupported matmul kernel: {matmul_kernel}")
 
   # Layer 1
-  # YOUR CODE HERE  
-
-  # Layer 2 (output)
-  # YOUR CODE HERE
-
+  probs = nl.ndarray((BATCH_SIZE, HIDDEN_SIZE), dtype=X.dtype, buffer=nl.hbm)
+  probs = nki_bias_add_act(nki_matmul(nki_transpose(X), W1), b1)
+  probs = nki_bias_add_act(nki_matmul(nki_transpose(probs), W2), b2, act='softmax')
   return probs
-
+  
 
 @nki.jit
 def nki_predict(
@@ -120,10 +171,14 @@ def nki_predict(
   Returns:
       predictions: a 1D tensor of shape [BATCH_SIZE] with the predicted class for each input
   """
-  probs = # YOUR CODE HERE
+  probs = nki_forward(X, W1, b1, W2, b2, matmul_kernel)
   BATCH_SIZE, OUTPUT_SIZE = probs.shape
   predictions = nl.ndarray((BATCH_SIZE,), dtype=np.int32, buffer=nl.hbm)
 
   # YOUR CODE HERE
-
+  for i in nl.affine_range(BATCH_SIZE):
+    tile = nl.load(probs[i:i+1, :])
+    max8_values = nisa.max8(src=tile)
+    max8_indices = nisa.nc_find_index8(vals=max8_values, data=tile)
+    nl.store(predictions[i], max8_indices[0, 0])
   return predictions
