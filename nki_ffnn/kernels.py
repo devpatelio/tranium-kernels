@@ -52,16 +52,19 @@ def nki_bias_add_act(A, b, act='relu'):
     result = nl.ndarray((BATCH_SIZE, HIDDEN_SIZE), dtype=A.dtype, buffer=nl.hbm)
 
     # YOUR CODE HERE
-    for i in nl.affine_range(BATCH_SIZE):
-      for j in nl.affine_range(HIDDEN_SIZE // nl.tile_size.pmax):
-        j_p = j * nl.tile_size.pmax
-        tile = nl.load(A[i, j_p:j_p+nl.tile_size.pmax])
-        bias = nl.load(b[0, j_p:j_p+nl.tile_size.pmax])
-        sum_tile = nl.add(tile, bias)
-        if act == 'relu':
-          nl.store(result[i, j_p:j_p+nl.tile_size.pmax], nl.relu(sum_tile))
+    if act == 'relu':
+      for i in nl.affine_range(BATCH_SIZE):
+        row_idx = nl.mgrid[0:1, 0:nl.tile_size.pmax]
+        for j in nl.affine_range(HIDDEN_SIZE // nl.tile_size.pmax):
+          j_p = j * nl.tile_size.pmax
+          tile = nl.ndarray((1, nl.tile_size.pmax), dtype=A.dtype, buffer=nl.sbuf)
+          nisa.dma_copy(dst=tile, src=A[i+row_idx.p, j_p+row_idx.x])
+          bias = nl.load(b[row_idx.p, j_p+row_idx.x])
+          sum_tile = nl.add(tile, bias)
+          nisa.dma_copy(dst=result[i+row_idx.p, j_p+row_idx.x], src=nl.relu(sum_tile))
 
-      if act == 'softmax':
+    if act == 'softmax':
+      for i in nl.affine_range(BATCH_SIZE):
         row_idx = nl.mgrid[0:1, 0:nl.tile_size.pmax]
         row_max = nl.ndarray((1, 1), dtype=A.dtype, buffer=nl.sbuf)
         row_sum = nl.ndarray((1, 1), dtype=A.dtype, buffer=nl.sbuf)
